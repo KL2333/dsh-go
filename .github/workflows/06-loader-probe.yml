@@ -64,18 +64,28 @@ jobs:
           LLVM="$T/llvm"
           R="$T/build/runtimes"
           SRC="$T/inputs/loader-root/packages/native"
+          python3 - "$SRC" > "$T/sources.txt" <<'PY'
+          import json, sys, pathlib
+          native = pathlib.Path(sys.argv[1])
+          binding = json.loads((native / 'binding.gyp').read_text())['targets'][0]
+          names = list(binding['sources']) + list(binding['conditions'][0][2]['sources'])
+          for name in names:
+              path = native / name
+              print(path if path.exists() else 'MISSING ' + str(path), file=sys.stderr if not path.exists() else sys.stdout)
+          PY
+          echo "===== sources"
+          cat "$T/sources.txt"
+          mapfile -t FILES < "$T/sources.txt"
           set +e
           "$LLVM/bin/clang++" --target=aarch64-linux-ohos --sysroot="$SDK/sysroot" \
             -resource-dir="$R/clang-resource" -stdlib++-isystem"$R/include/c++/v1" -D__MUSL__=1 \
-            -std=c++17 -O2 -g0 -fPIC -shared -pthread -stdlib=libc++ -fvisibility=hidden -fno-exceptions \
+            -std=c++17 -O2 -g0 -fPIC -fvisibility=hidden -fno-exceptions \
             -include "$GITHUB_WORKSPACE/runtime/ohos/node/napi-rename.h" \
             -DNAPI_VERSION=9 -DNARB_BACKEND=1 -DNARB_PRODUCT=1 \
             -DNODE_ADDON_API_DISABLE_CPP_EXCEPTIONS -DNODE_GYP_MODULE_NAME=require_builtin \
             -I "$T/node-src/src" -I "$T/addon-api/package" \
-            "$SRC/src/node_api_addon.cc" "$SRC/src/debug_trace.cc" "$SRC/src/native_types.cc" \
-            "$SRC/src/runtime_context/platform.cc" "$SRC/src/runtime_context/embedded_data.cc" \
-            -fsyntax-only 2>&1 | tee "$T/probe.log"
+            "${FILES[@]}" -fsyntax-only 2>&1 | tee "$T/probe.log"
           rc=${PIPESTATUS[0]}
           echo "syntax-probe rc=$rc"
-          echo "===== first 120 lines of probe.log"
-          head -n 120 "$T/probe.log" || true
+          echo "===== errors"
+          grep -E "error:" "$T/probe.log" | head -n 40 || true
