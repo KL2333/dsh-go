@@ -1,0 +1,177 @@
+# Fork-only build support: package the unsigned HAP from the AOT, native-lib and
+# runtime artifacts with tooling/ohos/check-arkts.sh --full.
+name: 04 ohos unsigned hap
+on:
+  workflow_dispatch:
+    inputs:
+      run_aot:
+        description: run id of the ohos-compile (AOT) run
+        required: true
+      aot_name:
+        description: AOT artifact name (ohos-aot-<sha>)
+        required: true
+      run_native:
+        description: run id of the 02 ohos native libs run
+        required: true
+      run_runtime:
+        description: run id of the 03 ohos runtime run
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ohos-unsigned-hap
+  cancel-in-progress: false
+env:
+  SDK_URL: https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+  SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+  SDK_CACHE_KEY: ohos-sdk-7.0-Release-linux-api26-v1
+  NODE_SRC_SHA256: 4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231
+jobs:
+  hap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore SDK cache
+        id: restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+      - name: Download and extract SDK
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          DL="$RUNNER_TEMP/sdk-dl"
+          mkdir -p "$DL" "$SDK"
+          curl -fL --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o "$DL/sdk.tar.gz" "$SDK_URL"
+          echo "$SDK_SHA256  $DL/sdk.tar.gz" | sha256sum -c -
+          tar -xzf "$DL/sdk.tar.gz" -C "$DL" ohos-sdk/linux
+          rm -f "$DL/sdk.tar.gz"
+          cd "$DL/ohos-sdk/linux"
+          shopt -s nullglob
+          for zip in *.zip; do
+            part="${zip%%-linux-x64-*}"
+            mkdir -p "$SDK/$part"
+            echo "unpack $zip -> $SDK/$part"
+            unzip -q -o "$zip" -d "$SDK/$part"
+          done
+          for part in ets js native toolchains; do
+            if [ ! -f "$SDK/$part/oh-uni-package.json" ]; then
+              inner="$(find "$SDK/$part" -mindepth 2 -maxdepth 2 -name oh-uni-package.json -print -quit)"
+              if [ -n "$inner" ]; then
+                d="$(dirname "$inner")"
+                shopt -s dotglob
+                mv "$d"/* "$SDK/$part/"
+                rmdir "$d"
+                shopt -u dotglob
+              fi
+            fi
+          done
+          rm -rf "$DL"
+      - name: Verify SDK API level
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          cat "$SDK/native/oh-uni-package.json" || true
+          api="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiVersion"))' "$SDK/ets/oh-uni-package.json")"
+          echo "ets apiVersion=$api"
+          test "$api" = 26 || { echo "SDK ets apiVersion is $api, expected 26"; exit 1; }
+      - name: Download AOT artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.aot_name }}
+          run-id: ${{ inputs.run_aot }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/aot
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: ohos-native-libs
+          run-id: ${{ inputs.run_native }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/native
+      - name: Download runtime archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ohos-runtime-rawfile
+          run-id: ${{ inputs.run_runtime }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/runtime
+      - name: Download Node source headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          curl -fL --retry 8 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o "$T/node-src.tar.xz" "https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz"
+          echo "$NODE_SRC_SHA256  $T/node-src.tar.xz" | sha256sum -c -
+          mkdir -p "$T/node-src"
+          tar -xJf "$T/node-src.tar.xz" -C "$T/node-src" --strip-components=1
+          rm -f "$T/node-src.tar.xz"
+          test -f "$T/node-src/src/node_api.h"
+          ls -l "$T/aot" "$T/native" "$T/runtime"
+          test -f "$T/aot/arm64-v8a/app.so"
+          test -f "$T/aot/flutter_assets/AssetManifest.bin"
+          test -f "$T/native/arm64-v8a/libnode.so"
+          test -f "$T/native/arm64-v8a/libsqlite3.so"
+          test -f "$T/runtime/dsh-runtime-rawfile.zip"
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: check-arkts.sh --full
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          bash tooling/ohos/check-arkts.sh \
+            --sdk "$T/ohos-sdk" \
+            --work "$T/work" \
+            --full \
+            --aot "$T/aot" \
+            --native "$T/native/arm64-v8a" \
+            --runtime "$T/runtime/dsh-runtime-rawfile.zip" \
+            --node-headers "$T/node-src/src" \
+            --with-forks
+      - name: Collect unsigned HAP
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/out"
+          hap="$(find "$T/work" -name 'entry-default-unsigned.hap' -print -quit || true)"
+          echo "hap=$hap"
+          if [ -n "$hap" ]; then
+            cp "$hap" "$T/out/entry-default-unsigned.hap"
+          fi
+          for f in hap-audit.json build-identity.json diagnostics.txt diagnostic-source-paths.json hvigor.log; do
+            src="$(find "$T/work" -maxdepth 3 -name "$f" -print -quit || true)"
+            if [ -n "$src" ]; then cp "$src" "$T/out/$f"; fi
+          done
+          ls -l "$T/out" || true
+          if [ -f "$T/out/entry-default-unsigned.hap" ]; then
+            sha256sum "$T/out/entry-default-unsigned.hap"
+          fi
+          if [ -f "$T/out/hap-audit.json" ]; then
+            python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps({k: d.get(k) for k in ("compileSdkType","compileSdkVersion","minAPIVersion","targetAPIVersion","versionCode","versionName","debug","aot","nativeLibs","rawfile")}, indent=1)[:3000])' "$T/out/hap-audit.json" || head -c 2000 "$T/out/hap-audit.json"
+          fi
+      - name: Upload unsigned HAP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-unsigned-hap
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: warn

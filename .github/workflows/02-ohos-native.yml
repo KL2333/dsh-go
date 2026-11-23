@@ -1,0 +1,209 @@
+# Fork-only build support: OpenHarmony arm64 native libraries for the HAP
+# (libnode.so, libc++_shared.so, libdsh_host.so, libdsh_flock.so,
+#  libdsh_require_builtin.so, libsqlite3.so) per runtime/ohos/node/BUILD.md.
+name: 02 ohos native libs
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ohos-native-libs
+  cancel-in-progress: false
+env:
+  SDK_URL: https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+  SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+  SDK_CACHE_KEY: ohos-sdk-7.0-Release-linux-api26-v1
+  LLVM_SRC_SHA256: ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6
+  NODE_SRC_SHA256: 4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231
+  NODE_HOST_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+  LOADER_SHA256: 286616f15e4f12013988e45ad27a69b4968a9f059c8bd351e412505230577948
+  SQLITE_SHA256: 0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9
+  SQLITE3_DART_SHA256: 8765980411f9b6733534efe9d014fad0750fa649590598772c04692deb34886b
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore SDK cache
+        id: restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+      - name: Download and extract SDK
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          DL="$RUNNER_TEMP/sdk-dl"
+          mkdir -p "$DL" "$SDK"
+          curl -fL --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o "$DL/sdk.tar.gz" "$SDK_URL"
+          echo "$SDK_SHA256  $DL/sdk.tar.gz" | sha256sum -c -
+          tar -xzf "$DL/sdk.tar.gz" -C "$DL" ohos-sdk/linux
+          rm -f "$DL/sdk.tar.gz"
+          cd "$DL/ohos-sdk/linux"
+          shopt -s nullglob
+          for zip in *.zip; do
+            part="${zip%%-linux-x64-*}"
+            mkdir -p "$SDK/$part"
+            echo "unpack $zip -> $SDK/$part"
+            unzip -q -o "$zip" -d "$SDK/$part"
+          done
+          for part in ets js native toolchains; do
+            if [ ! -f "$SDK/$part/oh-uni-package.json" ]; then
+              inner="$(find "$SDK/$part" -mindepth 2 -maxdepth 2 -name oh-uni-package.json -print -quit)"
+              if [ -n "$inner" ]; then
+                d="$(dirname "$inner")"
+                shopt -s dotglob
+                mv "$d"/* "$SDK/$part/"
+                rmdir "$d"
+                shopt -u dotglob
+              fi
+            fi
+          done
+          rm -rf "$DL"
+      - name: Verify SDK API level
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          cat "$SDK/native/oh-uni-package.json" || true
+          api="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiVersion"))' "$SDK/ets/oh-uni-package.json")"
+          echo "ets apiVersion=$api"
+          test "$api" = 26 || { echo "SDK ets apiVersion is $api, expected 26"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake make gcc g++ patch unzip xz-utils
+          node --version
+          npm --version
+          cmake --version | head -n 1
+          ninja --version
+          df -h /
+      - name: Fetch pinned build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/inputs"
+          cd "$T/inputs"
+          dl() { curl -fL --retry 8 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o "$1" "$2"; }
+          dl llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz"
+          dl llvm-src.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/llvm-project-23.1.1.src.tar.xz"
+          echo "$LLVM_SRC_SHA256  llvm-src.tar.xz" | sha256sum -c -
+          dl node-src.tar.xz "https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz"
+          echo "$NODE_SRC_SHA256  node-src.tar.xz" | sha256sum -c -
+          dl node-host.tar.xz "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz"
+          echo "$NODE_HOST_SHA256  node-host.tar.xz" | sha256sum -c -
+          dl loader.tar.gz "https://codeload.github.com/deepseek-ai/dsh-node-addon-require-builtin/tar.gz/a58d3599a2e551d7d706d1ff796c9fd4bbaff63c"
+          echo "$LOADER_SHA256  loader.tar.gz" | sha256sum -c -
+          dl sqlite.zip "https://sqlite.org/2026/sqlite-amalgamation-3540100.zip"
+          echo "$SQLITE_SHA256  sqlite.zip" | sha256sum -c -
+          dl sqlite3-dart.tar.gz "https://pub.dev/api/archives/sqlite3-3.9.1.tar.gz"
+          echo "$SQLITE3_DART_SHA256  sqlite3-dart.tar.gz" | sha256sum -c -
+          npm pack --silent @deepseek-ai/node-addon-system@0.1.2
+          npm pack --silent node-addon-api@8.9.2
+          mkdir -p "$T/llvm"
+          tar -xJf llvm.tar.xz -C "$T/llvm" --strip-components=1
+          mkdir -p "$T/node-host"
+          tar -xJf node-host.tar.xz -C "$T/node-host" --strip-components=1
+          mkdir -p "$T/node-src"
+          tar -xJf node-src.tar.xz -C "$T/node-src" --strip-components=1
+          mkdir -p flock loader node-addon-api sqlite3-dart
+          tar -xzf deepseek-ai-node-addon-system-0.1.2.tgz -C flock
+          tar -xzf node-addon-api-8.9.2.tgz -C node-addon-api
+          tar -xzf loader.tar.gz -C loader
+          ls -d loader/*/ | head -n 1
+          mkdir -p "$T/inputs/loader-root"
+          cp -a "$(ls -d loader/*/ | head -n 1)"* "$T/inputs/loader-root/"
+          tar -xzf sqlite3-dart.tar.gz -C sqlite3-dart
+          "$T/llvm/bin/clang++" --version | head -n 1
+          "$T/node-host/bin/node" --version
+          rm -f llvm.tar.xz node-host.tar.xz node-src.tar.xz
+          df -h /
+      - name: npm ci build-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
+          test -d runtime/ohos/node/build-tools/node_modules/esbuild
+      - name: build-runtimes.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 runtime/ohos/node/build-runtimes.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang" \
+            --source-archive "$T/inputs/llvm-src.tar.xz" \
+            --work "$T/build/runtimes-build" \
+            --output "$T/build/runtimes" \
+            --jobs 4
+      - name: build-node.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 runtime/ohos/node/build-node.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang" \
+            --cxx-runtime "$T/build/runtimes" \
+            --source-archive "$T/inputs/node-src.tar.xz" \
+            --host-node "$T/node-host/bin/node" \
+            --work "$T/build/node-build" \
+            --output "$T/build/node" \
+            --jobs 4
+      - name: Collect node build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          for f in "$RUNNER_TEMP"/build/node-build/*.log "$RUNNER_TEMP"/build/runtimes-build/*.log; do
+            [ -f "$f" ] && tail -n 500 "$f" > "$RUNNER_TEMP/logs/$(basename "$f")"
+          done
+          ls -la "$RUNNER_TEMP/build/node-build" 2>/dev/null | head -n 40 > "$RUNNER_TEMP/logs/dir.txt" || true
+      - name: Upload node build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-native-logs
+          path: ${{ runner.temp }}/logs
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: build-hap-libs.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/out"
+          python3 runtime/ohos/native/build-hap-libs.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang++" \
+            --cxx-runtime "$T/build/runtimes" \
+            --libnode-output "$T/build/node" \
+            --node-source "$T/node-src" \
+            --flock-package "$T/inputs/flock/package" \
+            --loader-source "$T/inputs/loader-root" \
+            --node-addon-api "$T/inputs/node-addon-api/package" \
+            --sqlite-amalgamation "$T/inputs/sqlite.zip" \
+            --sqlite3-package "$T/inputs/sqlite3-dart" \
+            --work "$T/build/hap-libs" \
+            --output "$T/out/arm64-v8a"
+          ls -l "$T/out/arm64-v8a"
+          sha256sum "$T/out/arm64-v8a"/* "$T/out/audit.json" 2>/dev/null || true
+          cat "$T/out/audit.json" 2>/dev/null | head -c 2000 || true
+      - name: Upload native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-native-libs
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+          if-no-files-found: error

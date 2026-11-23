@@ -1,0 +1,82 @@
+# Fork-only build support: compose the OHOS runtime rawfile archive
+# (one Stored dsh-runtime/runtime.zip) with the documented prepare/compose scripts.
+name: 03 ohos runtime
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ohos-runtime
+  cancel-in-progress: false
+env:
+  NPM_VERSION: 11.9.0
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Pin toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.9.0 --no-fund --no-audit
+          hash -r
+          echo "node=$(node --version) npm=$(npm --version)"
+          test "$(node --version)" = v24.22.1
+          test "$(npm --version)" = "$NPM_VERSION"
+      - name: npm ci build-tools and process
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund --prefix runtime/ohos/node/build-tools
+          (cd runtime/ohos/process && npm ci --ignore-scripts --no-audit --no-fund)
+      - name: Build the private RE2 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          node runtime/ohos/process/build-rg-regex.mjs "$PWD/runtime/ohos/node/build-tools"
+          ls -l runtime/ohos/process/build/re2js-unicode.mjs
+      - name: prepare-inputs.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 -I -B runtime/ohos/package/prepare-inputs.py \
+            --target ohos \
+            --node "$(command -v node)" \
+            --npm "$(command -v npm)" \
+            --cache "$T/npm-cache" \
+            --out "$T/prepared"
+      - name: compose-runtime.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 -I -B runtime/ohos/package/compose-runtime.py \
+            --target ohos \
+            --dsh-prefix "$T/prepared/dsh" \
+            --process-prefix "$T/prepared/process" \
+            --target-report "$T/prepared/target-report.json" \
+            --prepared-inputs "$T/prepared/prepared-inputs.json" \
+            --regex-artifact "$PWD/runtime/ohos/process/build/re2js-unicode.mjs" \
+            --esbuild-prefix "$PWD/runtime/ohos/node/build-tools" \
+            --imports-report "$T/imports.json" \
+            --out "$T/composed" \
+            --node "$(command -v node)" \
+            --runtime-core "$PWD/app/ohos/entry/src/main/ets/runtime/RuntimeCore.ets"
+          ls -l "$T/composed"
+          sha256sum "$T/composed/dsh-runtime-rawfile.zip"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print({k: d[k] for k in ("runtimeVersion","payloadBytes","payloadFiles","archiveBytes","archiveRoundTrip")})' "$T/composed/composition-report.json"
+      - name: Upload runtime archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-runtime-rawfile
+          path: |
+            ${{ runner.temp }}/composed/dsh-runtime-rawfile.zip
+            ${{ runner.temp }}/composed/composition-report.json
+          retention-days: 14
+          if-no-files-found: error

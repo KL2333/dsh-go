@@ -1,0 +1,97 @@
+# Fork-only build support: download the OpenHarmony 7.0-Release public SDK, verify
+# its API level, cache it for the other jobs, then probe check-arkts.sh without --full.
+name: 01 ohos sdk bootstrap
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ohos-sdk-bootstrap
+  cancel-in-progress: false
+env:
+  SDK_URL: https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+  SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+  SDK_CACHE_KEY: ohos-sdk-7.0-Release-linux-api26-v1
+jobs:
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore SDK cache
+        id: restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+      - name: Download and extract SDK
+        if: steps.restore.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          DL="$RUNNER_TEMP/sdk-dl"
+          mkdir -p "$DL" "$SDK"
+          curl -fL --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o "$DL/sdk.tar.gz" "$SDK_URL"
+          echo "$SDK_SHA256  $DL/sdk.tar.gz" | sha256sum -c -
+          tar -xzf "$DL/sdk.tar.gz" -C "$DL" ohos-sdk/linux
+          rm -f "$DL/sdk.tar.gz"
+          cd "$DL/ohos-sdk/linux"
+          shopt -s nullglob
+          for zip in *.zip; do
+            part="${zip%%-linux-x64-*}"
+            mkdir -p "$SDK/$part"
+            echo "unpack $zip -> $SDK/$part"
+            unzip -q -o "$zip" -d "$SDK/$part"
+          done
+          for part in ets js native toolchains; do
+            if [ ! -f "$SDK/$part/oh-uni-package.json" ]; then
+              inner="$(find "$SDK/$part" -mindepth 2 -maxdepth 2 -name oh-uni-package.json -print -quit)"
+              if [ -n "$inner" ]; then
+                d="$(dirname "$inner")"
+                shopt -s dotglob
+                mv "$d"/* "$SDK/$part/"
+                rmdir "$d"
+                shopt -u dotglob
+              fi
+            fi
+          done
+          rm -rf "$DL"
+      - name: Verify SDK API level
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          ls -l "$SDK"
+          for part in ets js native toolchains; do
+            python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sys.argv[2], "apiVersion=" + str(d.get("apiVersion")), "version=" + str(d.get("version")))' "$SDK/$part/oh-uni-package.json" "$part"
+          done
+          api="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiVersion"))' "$SDK/ets/oh-uni-package.json")"
+          test "$api" = 26 || { echo "SDK ets apiVersion is $api, expected 26"; exit 1; }
+      - name: Save SDK cache
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: ArkTS probe (no --full)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          java -version
+          bash tooling/ohos/check-arkts.sh \
+            --sdk "$RUNNER_TEMP/ohos-sdk" \
+            --work "$RUNNER_TEMP/arkts-probe" \
+            --with-forks
