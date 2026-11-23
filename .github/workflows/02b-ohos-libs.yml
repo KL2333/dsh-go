@@ -1,0 +1,148 @@
+name: 02b ohos native libs
+on:
+  workflow_dispatch:
+    inputs:
+      node_run:
+        description: run id of 02a that uploaded ohos-runtimes and ohos-libnode
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+  SDK_CACHE_KEY: ohos-sdk-7.0-Release-linux-api26-v1
+  LLVM_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+  NODE_SRC_URL: https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz
+  NODE_SRC_SHA256: 4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231
+  LOADER_SHA256: 286616f15e4f12013988e45ad27a69b4968a9f059c8bd351e412505230577948
+  LOADER_URL: https://codeload.github.com/deepseek-ai/dsh-node-addon-require-builtin/tar.gz/a58d3599a2e551d7d706d1ff796c9fd4bbaff63c
+  SQLITE_SHA256: 0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9
+  SQLITE3_DART_SHA256: 8765980411f9b6733534efe9d014fad0750fa649590598772c04692deb34886b
+
+jobs:
+  libs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SDK cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+
+      - name: Verify SDK API level
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          for part in ets js native toolchains; do test -f "$SDK/$part/oh-uni-package.json"; done
+          python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['apiVersion'])" "$SDK/ets/oh-uni-package.json"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake ninja-build patch unzip xz-utils
+
+      - name: Download runtimes artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.node_run }}
+          name: ohos-runtimes
+          path: ${{ runner.temp }}/node-art/ohos-runtimes
+
+      - name: Download libnode artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.node_run }}
+          name: ohos-libnode
+          path: ${{ runner.temp }}/node-art/ohos-libnode
+
+      - name: Lay out node inputs
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          ls -l "$T/node-art"
+          mv "$T/node-art/ohos-runtimes" "$T/runtimes"
+          mv "$T/node-art/ohos-libnode" "$T/libnode"
+          test -f "$T/libnode/libnode.so"
+          test -f "$T/libnode/build.json"
+          test -f "$T/runtimes/runtimes.json"
+
+      - name: Fetch pinned lib inputs
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/llvm" "$T/inputs/flock" "$T/inputs/node-addon-api" "$T/node-src"
+          curl -fsSL --retry 10 --retry-all-errors "$LLVM_URL" -o "$T/llvm.tar.xz"
+          tar -xJf "$T/llvm.tar.xz" -C "$T/llvm" --strip-components=1
+          curl -fsSL --retry 10 --retry-all-errors "$NODE_SRC_URL" -o "$T/node-src.tar.xz"
+          echo "$NODE_SRC_SHA256  $T/node-src.tar.xz" | sha256sum -c -
+          tar -xJf "$T/node-src.tar.xz" -C "$T/node-src" --strip-components=1
+          curl -fsSL --retry 10 --retry-all-errors "$LOADER_URL" -o "$T/inputs/loader.tar.gz"
+          echo "$LOADER_SHA256  $T/inputs/loader.tar.gz" | sha256sum -c -
+          mkdir -p "$T/inputs/loader-root" && tar -xzf "$T/inputs/loader.tar.gz" -C "$T/inputs/loader-root" --strip-components=1
+          curl -fsSL --retry 10 --retry-all-errors -o "$T/inputs/flock.tgz" "https://registry.npmjs.org/@deepseek-ai/node-addon-system/-/node-addon-system-0.1.2.tgz"
+          tar -xzf "$T/inputs/flock.tgz" -C "$T/inputs/flock"
+          curl -fsSL --retry 10 --retry-all-errors -o "$T/inputs/addon-api.tgz" "https://registry.npmjs.org/node-addon-api/-/node-addon-api-8.9.2.tgz"
+          tar -xzf "$T/inputs/addon-api.tgz" -C "$T/inputs/node-addon-api"
+          curl -fsSL --retry 10 --retry-all-errors https://sqlite.org/2026/sqlite-amalgamation-3540100.zip -o "$T/inputs/sqlite.zip"
+          echo "$SQLITE_SHA256  $T/inputs/sqlite.zip" | sha256sum -c -
+          curl -fsSL --retry 10 --retry-all-errors https://pub.dev/api/archives/sqlite3-3.9.1.tar.gz -o "$T/inputs/sqlite3-dart.tar.gz"
+          echo "$SQLITE3_DART_SHA256  $T/inputs/sqlite3-dart.tar.gz" | sha256sum -c -
+          mkdir -p "$T/inputs/sqlite3-dart" && tar -xzf "$T/inputs/sqlite3-dart.tar.gz" -C "$T/inputs/sqlite3-dart"
+
+      - name: build-hap-libs.py
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 runtime/ohos/native/build-hap-libs.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang++" \
+            --cxx-runtime "$T/runtimes" \
+            --libnode-output "$T/libnode" \
+            --node-source "$T/node-src" \
+            --flock-package "$T/inputs/flock/package" \
+            --loader-source "$T/inputs/loader-root" \
+            --node-addon-api "$T/inputs/node-addon-api/package" \
+            --work "$T/build/hap-libs" \
+            --output "$T/out/arm64-v8a" \
+            --sqlite-amalgamation "$T/inputs/sqlite.zip" \
+            --sqlite3-package "$T/inputs/sqlite3-dart"
+          ls -l "$T/out/arm64-v8a"
+          sha256sum "$T/out/arm64-v8a"/* "$T/out/audit.json" || true
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('audit status:', d.get('status')); print('audit problems:', d.get('problems', d.get('errors')))" "$T/out/audit.json" || true
+
+      - name: Dump native build logs on failure
+        if: failure()
+        run: |
+          T="$RUNNER_TEMP"
+          for f in "$T"/build/hap-libs/loader/*.log "$T"/build/hap-libs/flock/*.log "$T"/build/hap-libs/*/*.log "$T"/build/hap-libs/host/*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f"
+            tail -n 200 "$f"
+          done
+          echo "===== tree"
+          find "$T/build/hap-libs" -maxdepth 3 | head -n 60
+
+      - name: Upload native libs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-native-libs
+          path: ${{ runner.temp }}/out
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload libs logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-native-libs-logs
+          path: ${{ runner.temp }}/build/hap-libs
+          if-no-files-found: ignore
+          retention-days: 7

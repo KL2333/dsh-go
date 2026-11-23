@@ -1,0 +1,159 @@
+name: 02a ohos node runtime
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SDK_URL: https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz
+  SDK_SHA256: 130a438cbcddd46a2a5b09ee9925339cddf4cca99223329b860f96a5c72f338f
+  SDK_CACHE_KEY: ohos-sdk-7.0-Release-linux-api26-v1
+  LLVM_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+  LLVM_SRC_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/llvm-project-23.1.1.src.tar.xz
+  LLVM_SRC_SHA256: ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6
+  NODE_SRC_URL: https://nodejs.org/dist/v24.22.1/node-v24.22.1.tar.xz
+  NODE_SRC_SHA256: 4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231
+  NODE_HOST_URL: https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz
+  NODE_HOST_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+
+jobs:
+  node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SDK cache
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ohos-sdk
+          key: ${{ env.SDK_CACHE_KEY }}
+        continue-on-error: true
+
+      - name: Download and extract SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          curl -fsSL --retry 10 --retry-all-errors "$SDK_URL" -o "$T/sdk.tar.gz"
+          echo "$SDK_SHA256  $T/sdk.tar.gz" | sha256sum -c -
+          mkdir -p "$T/sdk-extract" && tar -xzf "$T/sdk.tar.gz" -C "$T/sdk-extract" ohos-sdk/linux
+          SDK="$T/ohos-sdk"
+          rm -rf "$SDK" && mkdir -p "$SDK"
+          for zip in "$T"/sdk-extract/ohos-sdk/linux/*.zip; do
+            part="$(basename "$zip")"; part="${part%%-linux-x64-*}"
+            unzip -q -o "$zip" -d "$SDK/$part"
+            if [ ! -f "$SDK/$part/oh-uni-package.json" ]; then
+              inner="$(find "$SDK/$part" -maxdepth 2 -name oh-uni-package.json | head -n1)"
+              [ -n "$inner" ] && mv "$(dirname "$inner")"/* "$SDK/$part"/
+            fi
+          done
+          rm -rf "$T/sdk-extract" "$T/sdk.tar.gz"
+
+      - name: Verify SDK API level
+        run: |
+          set -euo pipefail
+          SDK="$RUNNER_TEMP/ohos-sdk"
+          python3 - "$SDK" <<'PY'
+          import json, pathlib, sys
+          sdk = pathlib.Path(sys.argv[1])
+          for part in ('ets', 'js', 'native', 'toolchains'):
+              manifest = json.loads((sdk / part / 'oh-uni-package.json').read_text())
+              print(part, 'apiVersion=', manifest.get('apiVersion'), 'version=', manifest.get('version'))
+          assert json.loads((sdk / 'ets/oh-uni-package.json').read_text())['apiVersion'] == '26', 'SDK API != 26'
+          print('SDK OK')
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake ninja-build patch unzip xz-utils
+
+      - name: Fetch pinned build inputs
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/inputs" "$T/llvm" "$T/node-host" "$T/node-src"
+          curl -fsSL --retry 10 --retry-all-errors "$LLVM_URL" -o "$T/llvm.tar.xz"
+          tar -xJf "$T/llvm.tar.xz" -C "$T/llvm" --strip-components=1
+          curl -fsSL --retry 10 --retry-all-errors "$LLVM_SRC_URL" -o "$T/inputs/llvm-src.tar.xz"
+          echo "$LLVM_SRC_SHA256  $T/inputs/llvm-src.tar.xz" | sha256sum -c -
+          curl -fsSL --retry 10 --retry-all-errors "$NODE_SRC_URL" -o "$T/inputs/node-src.tar.xz"
+          echo "$NODE_SRC_SHA256  $T/inputs/node-src.tar.xz" | sha256sum -c -
+          curl -fsSL --retry 10 --retry-all-errors "$NODE_HOST_URL" -o "$T/node-host.tar.xz"
+          echo "$NODE_HOST_SHA256  $T/node-host.tar.xz" | sha256sum -c -
+          tar -xJf "$T/node-host.tar.xz" -C "$T/node-host" --strip-components=1
+          rm -f "$T/llvm.tar.xz" "$T/node-host.tar.xz"
+
+      - name: npm ci build-tools
+        run: |
+          set -euo pipefail
+          npm ci --prefix runtime/ohos/node/build-tools --ignore-scripts --no-audit --no-fund
+          test -d runtime/ohos/node/build-tools/node_modules/esbuild
+
+      - name: build-runtimes.py
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/logs"
+          python3 runtime/ohos/node/build-runtimes.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang" \
+            --source-archive "$T/inputs/llvm-src.tar.xz" \
+            --work "$T/build/runtimes-build" \
+            --output "$T/build/runtimes" \
+            --jobs 4 || { tail -n 300 "$T"/build/runtimes-build/*.log "$T"/*.log > "$T/logs/runtimes.log" 2>/dev/null; exit 1; }
+
+      - name: build-node.py
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP"
+          python3 runtime/ohos/node/build-node.py \
+            --sdk-native "$T/ohos-sdk/native" \
+            --clang "$T/llvm/bin/clang" \
+            --cxx-runtime "$T/build/runtimes" \
+            --source-archive "$T/inputs/node-src.tar.xz" \
+            --host-node "$T/node-host/bin/node" \
+            --work "$T/build/node-build" \
+            --output "$T/build/node" \
+            --jobs 4
+
+      - name: Collect node build logs on failure
+        if: failure()
+        run: |
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/logs"
+          find "$T/build" -maxdepth 3 -name '*.log' -exec sh -c 'echo "== $1"; tail -n 200 "$1"' _ {} \; > "$T/logs/node.log" 2>/dev/null || true
+          tail -n 120 "$T/logs/node.log" || true
+
+      - name: Upload node build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-node-logs
+          path: ${{ runner.temp }}/logs
+          retention-days: 7
+
+      - name: Upload runtimes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-runtimes
+          path: ${{ runner.temp }}/build/runtimes
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload libnode
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohos-libnode
+          path: ${{ runner.temp }}/build/node
+          if-no-files-found: ignore
+          retention-days: 14
