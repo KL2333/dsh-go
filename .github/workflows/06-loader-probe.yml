@@ -79,12 +79,17 @@ jobs:
           set +e
           "$LLVM/bin/clang++" --target=aarch64-linux-ohos --sysroot="$SDK/sysroot" \
             -resource-dir="$R/clang-resource" -stdlib++-isystem"$R/include/c++/v1" -D__MUSL__=1 \
-            -std=c++17 -O2 -g0 -fPIC -fvisibility=hidden -fno-exceptions \
+            -std=c++17 -O2 -g0 -fPIC -shared -pthread -stdlib=libc++ -fvisibility=hidden -fno-exceptions \
             -include "$GITHUB_WORKSPACE/runtime/ohos/node/napi-rename.h" \
             -DNAPI_VERSION=9 -DNARB_BACKEND=1 -DNARB_PRODUCT=1 \
             -DNODE_ADDON_API_DISABLE_CPP_EXCEPTIONS -DNODE_GYP_MODULE_NAME=require_builtin \
+            -ffile-prefix-map="$T/inputs/loader-root=node-addon-require-builtin-0.1.9" \
             -I "$T/node-src/src" -I "$T/addon-api/package" \
-            "${FILES[@]}" -fsyntax-only 2>&1 | tee "$T/probe.log"
+            "${FILES[@]}" \
+            -L "$T/out" -Wl,-rpath-link,"$T/out" -lnode -ldl \
+            -L "$R/lib" --ld-path="$SDK/llvm/bin/ld.lld" -static-libstdc++ \
+            -Wl,--exclude-libs,ALL -Wl,-z,defs -Wl,-soname,require_builtin.node \
+            -fsyntax-only 2>&1 | tee "$T/probe.log"
           rc=${PIPESTATUS[0]}
           echo "syntax-probe rc=$rc"
           echo "===== errors"
