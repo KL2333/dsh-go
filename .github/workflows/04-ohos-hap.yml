@@ -143,6 +143,7 @@ jobs:
             --native "$T/native/arm64-v8a" \
             --runtime "$T/runtime/dsh-runtime-rawfile.zip" \
             --node-headers "$T/node-src/src" \
+            --hms-stubs \
             --with-forks
       - name: Collect unsigned HAP
         if: always()

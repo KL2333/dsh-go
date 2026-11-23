@@ -94,4 +94,5 @@ jobs:
           bash tooling/ohos/check-arkts.sh \
             --sdk "$RUNNER_TEMP/ohos-sdk" \
             --work "$RUNNER_TEMP/arkts-probe" \
-            --with-forks
+            --with-forks \
+            --hms-stubs

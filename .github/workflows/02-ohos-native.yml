@@ -127,7 +127,7 @@ jobs:
           tar -xzf sqlite3-dart.tar.gz -C sqlite3-dart
           "$T/llvm/bin/clang++" --version | head -n 1
           "$T/node-host/bin/node" --version
-          rm -f llvm.tar.xz node-host.tar.xz node-src.tar.xz
+          rm -f llvm.tar.xz node-host.tar.xz
           df -h /
       - name: npm ci build-tools
         shell: bash
